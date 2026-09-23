@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-server-odoo"
-version = "1.2.1"
+version = "1.2.1+nomada.1"
 description = "AI connector for Odoo ERP -- connect Claude, ChatGPT, and other AI tools to Odoo via MCP (Model Context Protocol)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -63,6 +63,7 @@ dev = [
 
 [project.scripts]
 mcp-server-odoo = "mcp_server_odoo.__main__:main"
+nomada-backoffice-odoo = "mcp_server_odoo.backoffice:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_server_odoo"]
