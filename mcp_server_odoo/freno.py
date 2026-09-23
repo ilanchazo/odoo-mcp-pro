@@ -18,6 +18,8 @@ Perfil ``backoffice`` (Alba):
 - Deja notas internas y actividades. Nunca manda un correo.
 - Registra leads y contactos nuevos, sin etiquetas (la etiqueta Catálogo dispara
   un correo al cliente) y sin duplicar un contacto que ya existe.
+- Prepara el pedido de compra al proveedor en BORRADOR desde un presupuesto ya
+  confirmado, sin pasar del coste presupuestado. Confirmarlo y enviarlo, en pantalla.
 - Nunca borra nada, nunca importa, nunca llama a un método de Odoo.
 
 Los frenos de negocio (cuentas reservadas, producto genérico, coste, margen, techo
@@ -56,6 +58,7 @@ USUARIO_GABRIELA = 6
 SUELO_MARGEN = 0.25  # reglas-comerciales §1.1, suelo absoluto no-AEOL
 SUELO_MARGEN_AEOL = 0.18  # §1.5
 TECHO_IMPORTE = 5000.0  # ficha de backoffice: más de 5.000 € es de Iván
+HOLGURA_COMPRA = 0.05  # la compra puede pasar el coste presupuestado un 5 % (+1 €)
 
 METODOS_LECTURA = {
     "search",
@@ -69,7 +72,7 @@ METODOS_LECTURA = {
     "default_get",
 }
 
-MODELOS_CON_CHATTER = {"crm.lead", "sale.order", "res.partner"}
+MODELOS_CON_CHATTER = {"crm.lead", "sale.order", "res.partner", "purchase.order"}
 
 CAMPOS_PRESUPUESTO = {
     "partner_id",
@@ -132,6 +135,26 @@ CAMPOS_CONTACTO = {
     "country_id",
     "vat",
     "website",
+}
+CAMPOS_COMPRA = {
+    "partner_id",
+    "origin",
+    "partner_ref",
+    "date_planned",
+    "notes",
+    "dest_address_id",
+    "order_line",
+    "user_id",
+}
+CAMPOS_LINEA_COMPRA = {
+    "product_id",
+    "name",
+    "product_qty",
+    "price_unit",
+    "date_planned",
+    "sale_line_id",
+    "display_type",
+    "sequence",
 }
 CAMPOS_ACTIVIDAD_CREAR = {
     "res_model",
@@ -218,9 +241,11 @@ class Freno:
             return self._crear_actividad(vals)
         if model == "mail.message":
             return self._crear_nota(vals)
-        if model == "sale.order.line":
+        if model == "purchase.order":
+            return self._crear_compra(vals)
+        if model in ("sale.order.line", "purchase.order.line"):
             raise FrenoError(
-                "las líneas se crean dentro del presupuesto (order_line con [0, 0, {…}]), "
+                "las líneas se crean dentro del pedido (order_line con [0, 0, {…}]), "
                 "no sueltas."
             )
         raise FrenoError(f"desde Claude no se crean registros de «{model}».")
@@ -341,9 +366,11 @@ class Freno:
                         f"la actividad {act['id']} no es de Alba: no se toca."
                     )
             return
-        if model == "sale.order.line":
+        if model == "purchase.order":
+            return self._editar_compra(ids, vals)
+        if model in ("sale.order.line", "purchase.order.line"):
             raise FrenoError(
-                "las líneas se corrigen desde el presupuesto (order_line con [1, id, {…}])."
+                "las líneas se corrigen desde el pedido (order_line con [1, id, {…}])."
             )
         raise FrenoError(f"desde Claude no se modifican registros de «{model}».")
 
@@ -409,6 +436,146 @@ class Freno:
                     "y [2, id] (quitar)."
                 )
         return list(actuales.values()) + nuevas
+
+    # --- compras: lanzar un pedido confirmado ----------------------------------
+
+    def _crear_compra(self, vals: Dict[str, Any]) -> None:
+        self._solo_campos(vals, CAMPOS_COMPRA, "el pedido de compra")
+        self._usuario_propio(vals)
+        if not vals.get("partner_id"):
+            raise FrenoError("el pedido de compra necesita proveedor (partner_id).")
+        venta = self._venta_confirmada(vals.get("origin"))
+        lineas = []
+        for cmd in vals.get("order_line") or []:
+            if not isinstance(cmd, (list, tuple)) or not cmd or cmd[0] != 0:
+                raise FrenoError("al crear la compra las líneas van solo como [0, 0, {…}].")
+            self._comprobar_linea_compra(cmd[2], nueva=True)
+            lineas.append(dict(cmd[2]))
+        if not lineas:
+            raise FrenoError("el pedido de compra necesita al menos una línea.")
+        self._comprobar_coste_compra(venta, self._importe_compra(lineas), excluir=None)
+
+    def _editar_compra(self, ids: List[int], vals: Dict[str, Any]) -> None:
+        self._solo_campos(vals, CAMPOS_COMPRA, "el pedido de compra")
+        self._usuario_propio(vals)
+        compras = self._rpc(
+            "purchase.order",
+            "read",
+            [ids],
+            {"fields": ["name", "state", "user_id", "origin", "order_line"]},
+        )
+        if len(compras) != len(set(ids)):
+            raise FrenoError("algún pedido de compra no existe o Alba no lo ve.")
+        for c in compras:
+            if c["state"] != "draft":
+                raise FrenoError(
+                    f"{c['name']} ya no está en borrador: se toca en pantalla, no desde Claude."
+                )
+            if _m2o(c["user_id"]) != self._uid():
+                raise FrenoError(f"{c['name']} no es de Alba: Claude solo corrige los suyos.")
+            venta = self._venta_confirmada(vals.get("origin", c["origin"]))
+            if "order_line" in vals:
+                actuales = {}
+                if c["order_line"]:
+                    for l in self._rpc(
+                        "purchase.order.line",
+                        "read",
+                        [c["order_line"]],
+                        {"fields": ["product_qty", "price_unit", "display_type"]},
+                    ):
+                        actuales[l["id"]] = dict(l)
+                nuevas = []
+                for cmd in vals["order_line"]:
+                    op = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else None
+                    if op == 0:
+                        self._comprobar_linea_compra(cmd[2], nueva=True)
+                        nuevas.append(dict(cmd[2]))
+                    elif op in (1, 2) and cmd[1] in actuales:
+                        if op == 1:
+                            self._comprobar_linea_compra(cmd[2], nueva=False)
+                            actuales[cmd[1]].update(cmd[2])
+                        else:
+                            actuales.pop(cmd[1])
+                    else:
+                        raise FrenoError(
+                            f"en order_line de {c['name']} solo valen [0, 0, {{…}}], "
+                            "[1, id, {…}] y [2, id] sobre sus propias líneas."
+                        )
+                importe = self._importe_compra(list(actuales.values()) + nuevas)
+                self._comprobar_coste_compra(venta, importe, excluir=c["id"])
+
+    def _venta_confirmada(self, origen: Any) -> Dict[str, Any]:
+        if not origen:
+            raise FrenoError(
+                "la compra necesita el presupuesto de venta en origin (p. ej. «S05655»): "
+                "sin él nadie sabe para qué se compra."
+            )
+        ventas = self._rpc(
+            "sale.order",
+            "search_read",
+            [[["name", "=", origen]]],
+            {"fields": ["id", "name", "state", "order_line", "partner_id"], "limit": 1},
+        )
+        if not ventas:
+            raise FrenoError(f"el presupuesto {origen} no existe o Alba no lo ve.")
+        venta = ventas[0]
+        if venta["state"] != "sale":
+            raise FrenoError(
+                f"{origen} no está confirmado: solo se lanza a proveedor un pedido que el "
+                "cliente ya ha aceptado y está confirmado en Odoo."
+            )
+        self._comprobar_cuenta(venta["partner_id"])
+        return venta
+
+    def _comprobar_linea_compra(self, vals: Dict[str, Any], nueva: bool) -> None:
+        self._solo_campos(vals, CAMPOS_LINEA_COMPRA, "la línea de compra")
+        if vals.get("display_type"):
+            return
+        if nueva and not vals.get("product_id"):
+            raise FrenoError("cada línea de compra necesita su producto (product_id).")
+        if (nueva or "product_qty" in vals) and not (vals.get("product_qty") or 0) > 0:
+            raise FrenoError("la línea de compra necesita cantidad (product_qty).")
+        if nueva and not vals.get("date_planned"):
+            raise FrenoError(
+                "cada línea de compra necesita date_planned (cuándo tiene que llegar); "
+                "Odoo no la pone sola por API."
+            )
+        if (nueva or "price_unit" in vals) and (vals.get("price_unit") is None or vals["price_unit"] < 0):
+            raise FrenoError("la línea de compra necesita el precio del proveedor (price_unit).")
+
+    @staticmethod
+    def _importe_compra(lineas: List[Dict]) -> float:
+        return sum(
+            float(l.get("product_qty") or 0) * float(l.get("price_unit") or 0)
+            for l in lineas
+            if not l.get("display_type")
+        )
+
+    def _comprobar_coste_compra(self, venta: Dict, importe: float, excluir: Optional[int]) -> None:
+        presupuestado = 0.0
+        if venta["order_line"]:
+            for l in self._rpc(
+                "sale.order.line",
+                "read",
+                [venta["order_line"]],
+                {"fields": ["product_uom_qty", "purchase_price", "display_type"]},
+            ):
+                if not l.get("display_type"):
+                    presupuestado += float(l["product_uom_qty"] or 0) * float(l["purchase_price"] or 0)
+        otras = self._rpc(
+            "purchase.order",
+            "search_read",
+            [[["origin", "=", venta["name"]], ["state", "!=", "cancel"]]],
+            {"fields": ["id", "amount_untaxed"]},
+        )
+        ya = sum(float(o["amount_untaxed"] or 0) for o in otras if o["id"] != excluir)
+        total = ya + importe
+        if total > presupuestado * (1 + HOLGURA_COMPRA) + 1:
+            raise FrenoError(
+                f"lo que se compra para {venta['name']} ({total:,.2f} €, contando las compras "
+                f"ya hechas) pasa el coste presupuestado ({presupuestado:,.2f} €). El margen "
+                "se come: esto es de Iván antes de lanzar."
+            )
 
     # --- frenos de negocio ------------------------------------------------------
 

@@ -18,7 +18,14 @@ PEDIDOS = {
     1: {"name": "S1", "state": "draft", "user_id": [ALBA, "Alba"], "partner_id": [100, "x"], "order_line": [11]},
     2: {"name": "S2", "state": "sent", "user_id": [ALBA, "Alba"], "partner_id": [100, "x"], "order_line": []},
     3: {"name": "S3", "state": "draft", "user_id": [7, "Iván"], "partner_id": [100, "x"], "order_line": []},
+    4: {"name": "S4", "state": "sale", "user_id": [ALBA, "Alba"], "partner_id": [100, "x"], "order_line": [11]},
+    5: {"name": "S5", "state": "sale", "user_id": [7, "Iván"], "partner_id": [200, "Cecotec"], "order_line": [11]},
 }
+COMPRAS = {  # coste presupuestado de S4: 100 × 2,00 = 200 €
+    31: {"name": "P31", "state": "draft", "user_id": [ALBA, "Alba"], "origin": "S4", "order_line": [41], "amount_untaxed": 150.0},
+    32: {"name": "P32", "state": "purchase", "user_id": [ALBA, "Alba"], "origin": "S4", "order_line": [], "amount_untaxed": 30.0},
+}
+LINEAS_COMPRA = {41: {"product_qty": 100, "price_unit": 1.5, "display_type": False}}
 LINEAS = {
     11: {"product_id": [500, "Taza"], "name": "Taza", "product_uom_qty": 100, "price_unit": 3.0,
          "purchase_price": 2.0, "discount": 0, "display_type": False, "sequence": 10},
@@ -35,6 +42,16 @@ def rpc(model, method, args, kwargs):
         if campo == "email" and valor in EMAILS:
             return [EMAILS[valor]]
         return []
+    if model == "sale.order" and method == "search_read":
+        nombre = args[0][0][2]
+        return [dict(v, id=k) for k, v in PEDIDOS.items() if v["name"] == nombre]
+    if model == "purchase.order" and method == "search_read":
+        origen = args[0][0][2]
+        return [{"id": k, "amount_untaxed": v["amount_untaxed"]} for k, v in COMPRAS.items() if v["origin"] == origen]
+    if model == "purchase.order" and method == "read":
+        return [dict(COMPRAS[i], id=i) for i in args[0] if i in COMPRAS]
+    if model == "purchase.order.line" and method == "read":
+        return [dict(LINEAS_COMPRA[i], id=i) for i in args[0]]
     if model == "sale.order" and method == "read":
         return [dict(PEDIDOS[i], id=i) for i in args[0] if i in PEDIDOS]
     if model == "sale.order.line" and method == "read":
@@ -264,6 +281,78 @@ def test_create_en_lote(freno):
     with pytest.raises(FrenoError):
         freno.comprobar("sale.order", "create", [[{"partner_id": 100, "order_line": [linea()]},
                                                   {"partner_id": 200, "order_line": [linea()]}]], {})
+
+
+# --- lanzar a proveedor ----------------------------------------------------------------
+
+def lc(**kw):
+    base = {"product_id": 35, "name": "Tarjetas 85×55", "product_qty": 100, "price_unit": 0.1, "date_planned": "2026-10-01 10:00:00"}
+    base.update(kw)
+    return [0, 0, base]
+
+
+def compra(freno, **vals):
+    freno.comprobar("purchase.order", "create", [vals], {})
+
+
+def test_compra_buena(freno):
+    compra(freno, partner_id=900, origin="S4", partner_ref="Truyol 123", order_line=[lc(price_unit=0.19)])  # 150+30+19 ≤ 210
+
+
+def test_compra_pasa_coste(freno):
+    with pytest.raises(FrenoError, match="coste presupuestado"):
+        compra(freno, partner_id=900, origin="S4", order_line=[lc(price_unit=0.40)])  # 150+30+40 > 211
+
+
+def test_compra_sin_origen_o_sin_confirmar(freno):
+    with pytest.raises(FrenoError, match="origin"):
+        compra(freno, partner_id=900, order_line=[lc()])
+    with pytest.raises(FrenoError, match="no está confirmado"):
+        compra(freno, partner_id=900, origin="S1", order_line=[lc()])
+    with pytest.raises(FrenoError, match="no existe"):
+        compra(freno, partner_id=900, origin="S999", order_line=[lc()])
+
+
+def test_compra_cuenta_reservada(freno):
+    with pytest.raises(FrenoError, match="reservada"):
+        compra(freno, partner_id=900, origin="S5", order_line=[lc()])
+
+
+@pytest.mark.parametrize("campo", ["state", "company_id", "picking_type_id", "currency_id"])
+def test_compra_campos_prohibidos(freno, campo):
+    with pytest.raises(FrenoError):
+        compra(freno, partner_id=900, origin="S4", order_line=[lc()], **{campo: 1})
+
+
+def test_compra_sin_lineas_o_sin_cantidad(freno):
+    with pytest.raises(FrenoError):
+        compra(freno, partner_id=900, origin="S4", order_line=[])
+    with pytest.raises(FrenoError, match="cantidad"):
+        compra(freno, partner_id=900, origin="S4", order_line=[lc(product_qty=0)])
+
+
+def test_compra_corregir_borrador(freno):
+    freno.comprobar("purchase.order", "write", [[31], {"order_line": [[1, 41, {"price_unit": 1.6}]], "partner_ref": "x"}], {})
+
+
+def test_compra_corregir_pasa_coste(freno):
+    with pytest.raises(FrenoError, match="coste presupuestado"):
+        freno.comprobar("purchase.order", "write", [[31], {"order_line": [[1, 41, {"price_unit": 2.0}]]}], {})
+
+
+def test_compra_confirmada_no_se_toca(freno):
+    with pytest.raises(FrenoError, match="borrador"):
+        freno.comprobar("purchase.order", "write", [[32], {"notes": "x"}], {})
+
+
+@pytest.mark.parametrize("method", ["button_confirm", "action_rfq_send", "button_cancel", "unlink"])
+def test_compra_metodos(freno, method):
+    with pytest.raises(FrenoError):
+        freno.comprobar("purchase.order", method, [[31]], {})
+
+
+def test_nota_en_compra(freno):
+    freno.comprobar("mail.message", "create", [{"model": "purchase.order", "res_id": 31, "body": "Subido a la web de Truyol", "message_type": "comment", "subtype_id": 2}], {})
 
 
 def test_perfil_desconocido():
