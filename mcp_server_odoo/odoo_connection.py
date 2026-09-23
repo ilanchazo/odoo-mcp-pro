@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from .config import OdooConfig
 from .error_sanitizer import ErrorSanitizer
+from .freno import Freno
 from .exceptions import OdooConnectionError  # noqa: F401
 from .performance import PerformanceManager
 
@@ -48,6 +49,12 @@ class OdooConnection:
         """
         self.config = config
         self.timeout = timeout
+        self._freno: Optional[Freno] = None
+        if isinstance(getattr(config, "freno", None), str) and config.freno:
+            self._freno = Freno(
+                config.freno, lambda: self._uid, self._execute_kw_sin_freno
+            )
+            logger.info(f"Freno activo: perfil {config.freno}")
         self._url_components = self._parse_url(config.url)
 
         # Get appropriate endpoints based on mode
@@ -728,6 +735,14 @@ class OdooConnection:
         Raises:
             OdooConnectionError: If not authenticated or execution fails
         """
+        if self._freno is not None:
+            self._freno.comprobar(model, method, args, kwargs)
+        return self._execute_kw_sin_freno(model, method, args, kwargs)
+
+    def _execute_kw_sin_freno(
+        self, model: str, method: str, args: List[Any], kwargs: Dict[str, Any]
+    ) -> Any:
+        """execute_kw real. Solo lo llaman execute_kw y las lecturas del propio freno."""
         if not self._authenticated:
             raise OdooConnectionError("Not authenticated. Call authenticate() first.")
 

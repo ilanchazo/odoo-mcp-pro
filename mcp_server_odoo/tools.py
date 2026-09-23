@@ -80,6 +80,14 @@ class OdooToolHandler:
 
         # Register tools
         self._register_tools()
+        # Con freno, las herramientas que borran o importan ni se ofrecen a Claude.
+        # El freno de la conexión las pararía igual; así no las intenta.
+        if isinstance(getattr(config, "freno", None), str) and config.freno:
+            for nombre in ("delete_record", "delete_records", "import_records"):
+                try:
+                    self.app.remove_tool(nombre)
+                except Exception:
+                    pass
 
     async def _get_user_context(
         self,

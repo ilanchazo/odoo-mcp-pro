@@ -48,6 +48,11 @@ class OdooJSON2Connection:
         """
         self.config = config
         self.timeout = timeout
+        if isinstance(getattr(config, "freno", None), str) and config.freno:
+            # El freno solo está cableado en la conexión XML-RPC (Odoo 14-18).
+            raise OdooConnectionError(
+                "ODOO_MCP_FRENO no está soportado con JSON/2: no se arranca sin freno."
+            )
 
         # Parse and validate URL
         parsed = urlparse(config.url)
