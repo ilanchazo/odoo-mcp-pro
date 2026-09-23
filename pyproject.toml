@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-server-odoo"
-version = "1.2.1+nomada.1"
+version = "1.2.1+nomada.2"
 description = "AI connector for Odoo ERP -- connect Claude, ChatGPT, and other AI tools to Odoo via MCP (Model Context Protocol)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,7 +38,6 @@ dependencies = [
     "fastapi>=0.115.0",
     "jinja2>=3.1.0",
     "itsdangerous>=2.1.0",
-    "asyncpg>=0.30.0",
     "uvicorn>=0.32.0",
     "cryptography>=41.0.0",
     "posthog>=3.0.0",
@@ -52,6 +51,11 @@ Issues = "https://github.com/ivnvxd/mcp-server-odoo/issues"
 Changelog = "https://github.com/ivnvxd/mcp-server-odoo/releases"
 
 [project.optional-dependencies]
+# Modo servidor multiusuario (DATABASE_URL). Fuera de las dependencias base porque no
+# tiene binario para Windows ARM y el modo stdio no lo carga nunca (23/09/2026).
+multitenant = [
+    "asyncpg>=0.30.0",
+]
 dev = [
     "pytest>=8.3.5",
     "pytest-asyncio>=1.0.0",
