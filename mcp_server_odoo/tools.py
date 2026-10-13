@@ -34,6 +34,7 @@ from .schemas import (
     FieldSelectionMetadata,
     ImportResult,
     ModelsResult,
+    PostMessageResult,
     RecordResult,
     ResourceTemplatesResult,
     SearchResult,
@@ -831,6 +832,109 @@ class OdooToolHandler:
             self._track_usage(_current_sub.get(), "delete_records")
             return BulkDeleteResult(**result)
 
+        # --- Chatter and email ---
+
+        @self.app.tool(
+            title="Post Message (send email or internal note)",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+        async def post_message(
+            model: str,
+            record_id: int,
+            body: str,
+            internal_note: bool = False,
+            partner_ids: Optional[List[int]] = None,
+            subject: Optional[str] = None,
+            attachment_ids: Optional[List[int]] = None,
+            reply_to_message_id: Optional[int] = None,
+            preview: bool = True,
+        ) -> PostMessageResult:
+            """Post on a record's chatter, exactly like the buttons in Odoo's web UI.
+
+            internal_note=False is «Send message»: Odoo EMAILS partner_ids AND every
+            follower of the record subscribed to Discussions, from the current user;
+            replies come back to the same thread. internal_note=True is «Log note»:
+            nothing leaves Odoo. An email cannot be undone.
+
+            preview=True (default) sends NOTHING: it returns who would receive it.
+            Show that to the user, and call again with preview=False only after
+            the user approves that exact message and recipient list.
+
+            Args:
+                model: Model with chatter (e.g., 'crm.lead', 'sale.order', 'res.partner')
+                record_id: ID of the record
+                body: Message body in HTML (e.g., '<p>Hola Ana,</p><p>...</p>')
+                internal_note: True for an internal note, False to send an email
+                partner_ids: res.partner IDs to email, as many as needed (besides followers)
+                subject: Email subject (defaults to the record name)
+                attachment_ids: ir.attachment IDs to attach (create them first
+                    with create_record on 'ir.attachment', base64 in 'datas')
+                reply_to_message_id: mail.message ID being answered; Odoo keeps
+                    the email thread (In-Reply-To / References)
+                preview: True = only list recipients, False = post/send for real
+
+            Returns:
+                Recipients (preview) or the posted message ID and who was emailed.
+            """
+            result = await self._handle_post_message_tool(
+                model,
+                record_id,
+                body,
+                internal_note,
+                partner_ids,
+                subject,
+                attachment_ids,
+                reply_to_message_id,
+                preview,
+            )
+            self._track_usage(_current_sub.get(), "post_message")
+            return PostMessageResult(**result)
+
+        @self.app.tool(
+            title="Send Quotation by Email",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=False,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+        async def send_quotation(
+            order_id: int,
+            body: Optional[str] = None,
+            subject: Optional[str] = None,
+            partner_ids: Optional[List[int]] = None,
+            preview: bool = True,
+        ) -> PostMessageResult:
+            """Send a sale.order by email like its «Send by Email» button: Odoo's
+            own template, the quotation PDF attached, and a draft quotation is
+            marked as sent.
+
+            preview=True (default) sends NOTHING: it returns subject, body,
+            sender, attachments and every recipient (customer + followers).
+            Call again with preview=False only after the user approves it.
+
+            Args:
+                order_id: sale.order ID
+                body: HTML body replacing the template's (the PDF stays attached)
+                subject: Subject replacing the template's
+                partner_ids: res.partner IDs replacing the template's recipients
+                preview: True = only show what would be sent, False = send
+
+            Returns:
+                Preview of the email, or the sent message ID and who was emailed.
+            """
+            result = await self._handle_send_quotation_tool(
+                order_id, body, subject, partner_ids, preview
+            )
+            self._track_usage(_current_sub.get(), "send_quotation")
+            return PostMessageResult(**result)
+
         # --- Import (load) ---
 
         @self.app.tool(
@@ -1493,6 +1597,316 @@ class OdooToolHandler:
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
             raise ValidationError(f"Bulk delete failed: {sanitized_msg}") from e
 
+    def _record_url(self, connection: OdooConnectionProtocol, model: str, record_id: int) -> str:
+        base_url = (
+            getattr(connection, "_base_url", None) or (self.config.url if self.config else "")
+        ).rstrip("/")
+        return f"{base_url}/web#id={record_id}&model={model}&view_type=form"
+
+    def _partners_info(
+        self, connection: OdooConnectionProtocol, partner_ids: List[int]
+    ) -> List[Dict[str, Any]]:
+        if not partner_ids:
+            return []
+        partners = connection.read("res.partner", list(partner_ids), ["name", "email"])
+        return [{"id": p["id"], "name": p["name"], "email": p.get("email") or ""} for p in partners]
+
+    def _would_email(
+        self,
+        connection: OdooConnectionProtocol,
+        model: str,
+        record_id: int,
+        partner_ids: List[int],
+    ) -> List[Dict[str, Any]]:
+        """Who Odoo emails for a «Send message»: partner_ids plus followers
+        subscribed to Discussions, minus the author (mail.followers._get_recipient_data)."""
+        subtype = connection.search_read(
+            "ir.model.data",
+            [["module", "=", "mail"], ["name", "=", "mt_comment"]],
+            ["res_id"],
+        )
+        followers = connection.search_read(
+            "mail.followers",
+            [
+                ["res_model", "=", model],
+                ["res_id", "=", record_id],
+                ["subtype_ids", "in", [subtype[0]["res_id"]]],
+            ],
+            ["partner_id"],
+        )
+        author = connection.read("res.users", [connection.uid], ["partner_id"])[0]["partner_id"][0]
+        ids: List[int] = []
+        for pid in list(partner_ids) + [
+            f["partner_id"][0] for f in followers if f.get("partner_id")
+        ]:
+            if pid != author and pid not in ids:
+                ids.append(pid)
+        # Users set to «Handle by Odoo» get an inbox notification, not an email
+        inbox = {
+            u["partner_id"][0]
+            for u in connection.search_read(
+                "res.users",
+                [["partner_id", "in", ids], ["notification_type", "=", "inbox"]],
+                ["partner_id"],
+            )
+        }
+        info = []
+        for p in self._partners_info(connection, ids):
+            if p["id"] in inbox:
+                continue
+            p["status"] = "recipient" if p["id"] in partner_ids else "follower"
+            info.append(p)
+        return info
+
+    def _emailed(self, connection: OdooConnectionProtocol, message_id: int) -> List[Dict[str, Any]]:
+        notifications = connection.search_read(
+            "mail.notification",
+            [["mail_message_id", "=", message_id], ["notification_type", "=", "email"]],
+            ["res_partner_id", "notification_status"],
+        )
+        status = {
+            n["res_partner_id"][0]: n.get("notification_status", "")
+            for n in notifications
+            if n.get("res_partner_id")
+        }
+        info = self._partners_info(connection, list(status))
+        for p in info:
+            p["status"] = status[p["id"]]
+        return info
+
+    @staticmethod
+    def _names(partners: List[Dict[str, Any]]) -> str:
+        return ", ".join(f"{p['name']} <{p['email']}> ({p['status']})" for p in partners)
+
+    async def _handle_post_message_tool(
+        self,
+        model: str,
+        record_id: int,
+        body: str,
+        internal_note: bool,
+        partner_ids: Optional[List[int]],
+        subject: Optional[str],
+        attachment_ids: Optional[List[int]],
+        reply_to_message_id: Optional[int],
+        preview: bool,
+    ) -> Dict[str, Any]:
+        """Handle post message tool request (mail.thread.message_post)."""
+        try:
+            connection, access_controller, sub = await self._get_user_context()
+            with perf_logger.track_operation("tool_post_message", model=model):
+                access_controller.validate_model_access(model, "read")
+
+                if not connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+                if not body or not body.strip():
+                    raise ValidationError("No body provided for the message")
+                if not hasattr(connection, "execute_kw"):
+                    raise ValidationError("post_message needs the XML-RPC connection")
+                if internal_note and partner_ids:
+                    raise ValidationError(
+                        "An internal note emails no one: drop partner_ids or "
+                        "set internal_note=False"
+                    )
+                if not connection.read(model, [record_id], ["id"]):
+                    raise NotFoundError(f"Record not found: {model} with ID {record_id}")
+
+                pids = [int(p) for p in partner_ids or []]
+                url = self._record_url(connection, model, record_id)
+                kind = "note" if internal_note else "email"
+
+                if preview:
+                    recipients = (
+                        []
+                        if internal_note
+                        else self._would_email(connection, model, record_id, pids)
+                    )
+                    if internal_note:
+                        summary = "PREVIEW, nothing posted: internal note, no one is emailed"
+                    else:
+                        summary = "PREVIEW, nothing sent. Would email: " + (
+                            self._names(recipients) or "NO ONE"
+                        )
+                    return {
+                        "success": True,
+                        "preview": True,
+                        "kind": kind,
+                        "recipients": recipients,
+                        "subject": subject or "",
+                        "url": url,
+                        "message": summary,
+                    }
+
+                kwargs: Dict[str, Any] = {
+                    "body": body,
+                    "body_is_html": True,
+                    "message_type": "comment",
+                    "subtype_xmlid": "mail.mt_note" if internal_note else "mail.mt_comment",
+                }
+                if pids:
+                    kwargs["partner_ids"] = pids
+                if subject:
+                    kwargs["subject"] = subject
+                if attachment_ids:
+                    kwargs["attachment_ids"] = [int(a) for a in attachment_ids]
+                if reply_to_message_id:
+                    kwargs["parent_id"] = int(reply_to_message_id)
+
+                result = connection.execute_kw(model, "message_post", [[record_id]], kwargs)
+                message_id = result[0] if isinstance(result, list) else int(result)
+
+                emailed = [] if internal_note else self._emailed(connection, message_id)
+                if internal_note:
+                    summary = f"Internal note {message_id} logged on {model} {record_id}"
+                elif emailed:
+                    summary = f"Message {message_id} emailed to: {self._names(emailed)}"
+                else:
+                    summary = (
+                        f"Message {message_id} posted on {model} {record_id}; NO ONE was emailed"
+                    )
+                return {
+                    "success": True,
+                    "preview": False,
+                    "message_id": message_id,
+                    "kind": kind,
+                    "recipients": emailed,
+                    "subject": subject or "",
+                    "url": url,
+                    "message": summary,
+                }
+
+        except (ValidationError, NotFoundError):
+            raise
+        except AccessControlError as e:
+            raise ValidationError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in post_message tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to post message: {sanitized_msg}") from e
+
+    async def _handle_send_quotation_tool(
+        self,
+        order_id: int,
+        body: Optional[str],
+        subject: Optional[str],
+        partner_ids: Optional[List[int]],
+        preview: bool,
+    ) -> Dict[str, Any]:
+        """Handle send quotation tool request (sale.order «Send by Email» wizard)."""
+        model = "sale.order"
+        try:
+            connection, access_controller, sub = await self._get_user_context()
+            with perf_logger.track_operation("tool_send_quotation", model=model):
+                access_controller.validate_model_access(model, "read")
+
+                if not connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+                if not hasattr(connection, "execute_kw"):
+                    raise ValidationError("send_quotation needs the XML-RPC connection")
+                if not connection.read(model, [order_id], ["id"]):
+                    raise NotFoundError(f"Record not found: {model} with ID {order_id}")
+
+                # Same context the button opens the wizard with, in the user's language
+                lang = connection.read("res.users", [connection.uid], ["lang"])[0]["lang"]
+                action = connection.execute_kw(
+                    model, "action_quotation_send", [[order_id]], {"context": {"lang": lang}}
+                )
+                ctx = dict(action.get("context") or {}, lang=lang)
+
+                values: Dict[str, Any] = {}
+                if body:
+                    values["body"] = body
+                if subject:
+                    values["subject"] = subject
+                if partner_ids:
+                    values["partner_ids"] = [(6, 0, [int(p) for p in partner_ids])]
+                composer_id = connection.execute_kw(
+                    "mail.compose.message", "create", [values], {"context": ctx}
+                )
+                composer = connection.execute_kw(
+                    "mail.compose.message",
+                    "read",
+                    [
+                        [composer_id],
+                        ["subject", "body", "email_from", "partner_ids", "attachment_ids"],
+                    ],
+                    {"context": ctx},
+                )[0]
+                attachments = [
+                    a["name"]
+                    for a in connection.read("ir.attachment", composer["attachment_ids"], ["name"])
+                ]
+                url = self._record_url(connection, model, order_id)
+
+                if preview:
+                    recipients = self._would_email(
+                        connection, model, order_id, composer["partner_ids"]
+                    )
+                    return {
+                        "success": True,
+                        "preview": True,
+                        "kind": "email",
+                        "recipients": recipients,
+                        "subject": composer["subject"] or "",
+                        "body": composer["body"] or "",
+                        "email_from": composer["email_from"] or "",
+                        "attachments": attachments,
+                        "url": url,
+                        "message": "PREVIEW, nothing sent. Would email: "
+                        + (self._names(recipients) or "NO ONE"),
+                    }
+
+                before = connection.search(
+                    "mail.message",
+                    [["model", "=", model], ["res_id", "=", order_id]],
+                    limit=1,
+                    order="id desc",
+                )
+                connection.execute_kw(
+                    "mail.compose.message", "action_send_mail", [[composer_id]], {"context": ctx}
+                )
+                sent = connection.search(
+                    "mail.message",
+                    [
+                        ["model", "=", model],
+                        ["res_id", "=", order_id],
+                        ["message_type", "=", "comment"],
+                        ["id", ">", before[0] if before else 0],
+                    ],
+                    limit=1,
+                    order="id desc",
+                )
+                if not sent:
+                    raise ValidationError("Odoo did not post the quotation email")
+                message_id = sent[0]
+                emailed = self._emailed(connection, message_id)
+                state = connection.read(model, [order_id], ["state"])[0]["state"]
+                return {
+                    "success": True,
+                    "preview": False,
+                    "message_id": message_id,
+                    "kind": "email",
+                    "recipients": emailed,
+                    "subject": composer["subject"] or "",
+                    "email_from": composer["email_from"] or "",
+                    "attachments": attachments,
+                    "url": url,
+                    "message": f"Quotation emailed (order state: {state}) to: "
+                    + (self._names(emailed) or "NO ONE"),
+                }
+
+        except (ValidationError, NotFoundError):
+            raise
+        except AccessControlError as e:
+            raise ValidationError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ValidationError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in send_quotation tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ValidationError(f"Failed to send quotation: {sanitized_msg}") from e
+
     async def _handle_import_records_tool(
         self,
         model: str,
@@ -1527,7 +1941,13 @@ class OdooToolHandler:
                 # Validate context keys (prevent dangerous keys like 'su')
                 safe_context = None
                 if context:
-                    allowed_keys = {"tracking_disable", "defer_fields_computation", "lang", "tz", "no_reset_password"}
+                    allowed_keys = {
+                        "tracking_disable",
+                        "defer_fields_computation",
+                        "lang",
+                        "tz",
+                        "no_reset_password",
+                    }
                     unsafe_keys = set(context.keys()) - allowed_keys
                     if unsafe_keys:
                         raise ValidationError(f"Context contains disallowed keys: {unsafe_keys}")
@@ -1547,7 +1967,11 @@ class OdooToolHandler:
 
                 # Separate errors from warnings
                 errors = [
-                    {"row": msg.get("rows", {}).get("from", -1), "message": msg.get("message", ""), "type": msg.get("type", "error")}
+                    {
+                        "row": msg.get("rows", {}).get("from", -1),
+                        "message": msg.get("message", ""),
+                        "type": msg.get("type", "error"),
+                    }
                     for msg in messages
                     if msg.get("type") == "error"
                 ]

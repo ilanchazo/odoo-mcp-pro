@@ -198,6 +198,28 @@ class ImportResult(BaseModel):
     message: str = Field(description="Human-readable summary message")
 
 
+# --- Post Message ---
+
+
+class PostMessageResult(BaseModel):
+    """Result of post_message / send_quotation (preview or real send)."""
+
+    success: bool = Field(description="Whether the operation succeeded")
+    preview: bool = Field(description="True: nothing was sent, this is what would be sent")
+    kind: str = Field(description="'email' (leaves Odoo) or 'note' (internal)")
+    recipients: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Partners emailed (or that would be): id, name, email, status",
+    )
+    message_id: Optional[int] = Field(default=None, description="ID of the mail.message posted")
+    subject: str = Field(default="", description="Email subject")
+    body: str = Field(default="", description="Email body (HTML), in previews")
+    email_from: str = Field(default="", description="Sender")
+    attachments: List[str] = Field(default_factory=list, description="Attached file names")
+    url: str = Field(description="Direct URL to the record in Odoo web interface")
+    message: str = Field(description="Human-readable summary message")
+
+
 # --- Server Info ---
 
 

@@ -226,6 +226,70 @@ class TestWriteTools:
         assert "create_record" in decorated_functions
         assert "update_record" in decorated_functions
         assert "delete_record" in decorated_functions
+        assert "post_message" in decorated_functions
+        assert "send_quotation" in decorated_functions
+
+    @pytest.fixture
+    def chatter_connection(self, mock_connection):
+        """Connection answering the reads post_message makes."""
+        mock_connection.uid = 7
+
+        def search_read(model, domain, fields=None, **kwargs):
+            if model == "ir.model.data":
+                return [{"res_id": 1}]
+            if model == "mail.followers":
+                return [{"partner_id": [500, "Iván"]}, {"partner_id": [900, "Seguidor"]}]
+            if model == "mail.notification":
+                return [{"res_partner_id": [800, "Ana"], "notification_status": "ready"}]
+            return []
+
+        def read(model, ids, fields=None):
+            if model == "res.users":
+                return [{"id": 7, "partner_id": [500, "Iván"]}]
+            if model == "res.partner":
+                return [{"id": i, "name": f"P{i}", "email": f"p{i}@x.es"} for i in ids]
+            return [{"id": i} for i in ids]
+
+        mock_connection.search_read.side_effect = search_read
+        mock_connection.read.side_effect = read
+        mock_connection.execute_kw.return_value = 4242
+        return mock_connection
+
+    @pytest.mark.asyncio
+    async def test_post_message_preview_sends_nothing(self, tool_handler, chatter_connection):
+        """Preview lists recipients and followers, minus the author, without posting."""
+        result = await tool_handler._handle_post_message_tool(
+            "crm.lead", 1, "<p>Hola</p>", False, [800], None, None, None, True
+        )
+        chatter_connection.execute_kw.assert_not_called()
+        assert result["preview"] is True
+        assert [(p["id"], p["status"]) for p in result["recipients"]] == [
+            (800, "recipient"),
+            (900, "follower"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_post_message_send(self, tool_handler, chatter_connection):
+        """A real send calls message_post as HTML comment and reports who got it."""
+        result = await tool_handler._handle_post_message_tool(
+            "crm.lead", 1, "<p>Hola</p>", False, [800], "Asunto", None, 55, False
+        )
+        model, method, args, kwargs = chatter_connection.execute_kw.call_args[0]
+        assert (model, method, args) == ("crm.lead", "message_post", [[1]])
+        assert kwargs["body_is_html"] is True
+        assert kwargs["subtype_xmlid"] == "mail.mt_comment"
+        assert kwargs["partner_ids"] == [800]
+        assert kwargs["parent_id"] == 55
+        assert result["message_id"] == 4242
+        assert result["recipients"][0]["email"] == "p800@x.es"
+
+    @pytest.mark.asyncio
+    async def test_internal_note_with_partners_rejected(self, tool_handler, chatter_connection):
+        """An internal note cannot carry recipients: it would look sent and not be."""
+        with pytest.raises(ValidationError, match="internal note"):
+            await tool_handler._handle_post_message_tool(
+                "crm.lead", 1, "<p>x</p>", True, [800], None, None, None, False
+            )
 
 
 class TestWriteToolsIntegration:
