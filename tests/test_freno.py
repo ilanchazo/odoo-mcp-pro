@@ -358,3 +358,53 @@ def test_nota_en_compra(freno):
 def test_perfil_desconocido():
     with pytest.raises(ValueError):
         Freno("todo", lambda: ALBA, rpc)
+
+
+# --- el freno se activa de verdad al arrancar -------------------------------------
+# El 24/09/2026 se perdió la lectura de ODOO_MCP_FRENO en config.py y el conector de
+# Alba arrancó sin freno durante tres semanas sin que fallara ninguna prueba.
+
+
+def test_config_lee_odoo_mcp_freno(monkeypatch):
+    from mcp_server_odoo.config import load_config
+
+    monkeypatch.setenv("ODOO_URL", "https://odoo.example.com")
+    monkeypatch.setenv("ODOO_API_KEY", "x")
+    monkeypatch.setenv("ODOO_MCP_FRENO", "backoffice")
+    assert load_config().freno == "backoffice"
+
+
+def test_conexion_con_freno(monkeypatch):
+    from mcp_server_odoo.config import load_config
+    from mcp_server_odoo.odoo_connection import OdooConnection
+
+    monkeypatch.setenv("ODOO_URL", "https://odoo.example.com")
+    monkeypatch.setenv("ODOO_API_KEY", "x")
+    monkeypatch.setenv("ODOO_MCP_FRENO", "backoffice")
+    conn = OdooConnection(load_config())
+    with pytest.raises(FrenoError):
+        conn.execute_kw("crm.lead", "message_post", [[1]], {"body": "x"})
+
+
+def test_backoffice_fuerza_el_freno(monkeypatch):
+    import mcp_server_odoo.__main__ as arranque
+    from mcp_server_odoo import backoffice
+    from mcp_server_odoo.config import load_config
+
+    monkeypatch.setenv("ODOO_URL", "https://odoo.example.com")
+    monkeypatch.setenv("ODOO_API_KEY", "x")
+    monkeypatch.delenv("ODOO_MCP_FRENO", raising=False)
+    monkeypatch.setattr(arranque, "main", lambda: load_config().freno)
+    assert backoffice.main() == "backoffice"
+
+
+def test_con_freno_no_se_ofrece_enviar():
+    from unittest.mock import Mock
+
+    from mcp_server_odoo.tools import OdooToolHandler
+
+    app = Mock()
+    app.tool = Mock(side_effect=lambda **kw: (lambda f: f))
+    OdooToolHandler(app, Mock(), Mock(), Mock(freno="backoffice"))
+    quitadas = {c.args[0] for c in app.remove_tool.call_args_list}
+    assert {"post_message", "send_quotation", "delete_record", "import_records"} <= quitadas

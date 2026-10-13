@@ -42,6 +42,10 @@ class OdooConfig:
     # Skip validation for multi-tenant mode (no Odoo config at startup)
     skip_validation: bool = False
 
+    # Freno de Nómada (ODOO_MCP_FRENO): perfil que acota lo que se puede escribir.
+    # None = sin freno, comportamiento original. Ver freno.py.
+    freno: Optional[str] = None
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.skip_validation:
@@ -197,6 +201,7 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         transport=os.getenv("ODOO_MCP_TRANSPORT", "stdio").strip(),
         host=os.getenv("ODOO_MCP_HOST", "localhost").strip(),
         port=get_int_env("ODOO_MCP_PORT", 8000),
+        freno=os.getenv("ODOO_MCP_FRENO", "").strip() or None,
     )
 
     return config
