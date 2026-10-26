@@ -29,6 +29,7 @@ from .schemas import (
     BulkCreateResult,
     BulkDeleteResult,
     BulkUpdateResult,
+    CompleteActivityResult,
     CreateResult,
     DeleteResult,
     FieldSelectionMetadata,
@@ -90,6 +91,7 @@ class OdooToolHandler:
                 "import_records",
                 "post_message",
                 "send_quotation",
+                "complete_activity",
             ):
                 try:
                     self.app.remove_tool(nombre)
@@ -837,6 +839,41 @@ class OdooToolHandler:
             result = await self._handle_delete_records_tool(model, record_ids)
             self._track_usage(_current_sub.get(), "delete_records")
             return BulkDeleteResult(**result)
+
+        @self.app.tool(
+            title="Complete Activity with Feedback",
+            annotations=ToolAnnotations(
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+        async def complete_activity(
+            activity_id: int,
+            model: str,
+            record_id: int,
+            feedback: str,
+            preview: bool = True,
+        ) -> CompleteActivityResult:
+            """Mark ONE activity done using Odoo's native action_feedback, preserving history.
+
+            Requires the expected parent model/record ID to prevent completing an
+            activity from another document. feedback is plain text, not HTML.
+            preview=True only reads. Set preview=False when the user has authorized
+            completing this activity. Does not send a commercial email or confirm
+            the parent document. Odoo's configured activity chains/notifications still apply.
+            Restricted profiles cannot use this tool. Never use unlink as a substitute.
+
+            Returns completion verification and the native history message ID.
+            A missing activity is NOT proof of prior completion. After an uncertain
+            outcome, inspect the history before retrying; never recreate the activity.
+            """
+            result = await self._handle_complete_activity_tool(
+                activity_id, model, record_id, feedback, preview
+            )
+            self._track_usage(_current_sub.get(), "complete_activity")
+            return CompleteActivityResult(**result)
 
         # --- Chatter and email ---
 
@@ -1684,6 +1721,106 @@ class OdooToolHandler:
     @staticmethod
     def _names(partners: List[Dict[str, Any]]) -> str:
         return ", ".join(f"{p['name']} <{p['email']}> ({p['status']})" for p in partners)
+
+    async def _handle_complete_activity_tool(
+        self, activity_id: int, model: str, record_id: int, feedback: str, preview: bool
+    ) -> Dict[str, Any]:
+        """Complete through the public native method, then independently verify both effects."""
+        mutation_started = False
+        try:
+            connection, access_controller, _sub = await self._get_user_context()
+            if not connection.is_authenticated:
+                raise ValidationError("Not authenticated with Odoo")
+            if isinstance(getattr(self.config, "freno", None), str) and self.config.freno:
+                raise ValidationError("complete_activity is unavailable for restricted profiles")
+            if type(activity_id) is not int or activity_id <= 0:
+                raise ValidationError("activity_id must be a positive integer")
+            if type(record_id) is not int or record_id <= 0 or not model.strip():
+                raise ValidationError("Expected parent model and positive record_id are required")
+            if not feedback.strip():
+                raise ValidationError("Completion feedback is required")
+            if not callable(getattr(connection, "execute_kw", None)):
+                raise ValidationError("complete_activity needs the XML-RPC connection")
+            access_controller.validate_model_access("mail.activity", "read")
+            access_controller.validate_model_access("mail.activity", "write")
+            access_controller.validate_model_access(model, "read")
+            access_controller.validate_model_access("mail.message", "read")
+            activities = connection.read(
+                "mail.activity",
+                [activity_id],
+                ["id", "res_model", "res_id", "summary", "user_id", "activity_type_id", "active"],
+            )
+            if not activities:
+                raise NotFoundError(
+                    f"Activity {activity_id} not found; inspect history before retrying"
+                )
+            activity = activities[0]
+            if activity["res_model"] != model or activity["res_id"] != record_id:
+                raise ValidationError("Activity does not belong to the expected parent document")
+            if not activity.get("active", True):
+                raise ValidationError(
+                    "Activity is already archived; inspect history before retrying"
+                )
+            if not connection.read(model, [record_id], ["id"]):
+                raise NotFoundError("Parent document not found")
+            result = {
+                "success": True,
+                "preview": preview,
+                "completed": False,
+                "activity": activity,
+                "message_id": None,
+                "url": self._record_url(connection, model, record_id),
+                "message": "Preview only; activity has not been completed",
+            }
+            if preview:
+                return result
+            # Use the guarded connection: no sudo, private methods or raw unlink.
+            from html import escape
+
+            mutation_started = True
+            message_id = connection.execute_kw(
+                "mail.activity",
+                "action_feedback",
+                [[activity_id]],
+                {"feedback": escape(feedback).replace("\n", "<br/>")},
+            )
+            # Some activity types keep completed records archived instead of deleting them.
+            remaining = connection.read("mail.activity", [activity_id], ["id", "active"])
+            messages = (
+                connection.read("mail.message", [message_id], ["id", "model", "res_id"])
+                if type(message_id) is int and message_id > 0
+                else []
+            )
+            closed = not remaining or remaining[0].get("active") is False
+            history_matches = bool(
+                messages
+                and messages[0].get("model") == model
+                and messages[0].get("res_id") == record_id
+            )
+            result.update(
+                success=bool(closed and history_matches),
+                completed=bool(closed and history_matches),
+                message_id=message_id if type(message_id) is int and message_id > 0 else None,
+                message=(
+                    "Activity completed; native history verified"
+                    if closed and history_matches
+                    else "Completion could not be fully verified; inspect activity and history before retrying"
+                ),
+            )
+            return result
+        except Exception as exc:
+            if mutation_started:
+                raise ValidationError(
+                    "Completion outcome uncertain; inspect activity and history before retrying: "
+                    + ErrorSanitizer.sanitize_message(str(exc))
+                ) from exc
+            if isinstance(exc, (ValidationError, NotFoundError)):
+                raise
+            if isinstance(exc, AccessControlError):
+                raise ValidationError("Access denied while completing activity") from exc
+            raise ValidationError(
+                "Cannot complete activity: " + ErrorSanitizer.sanitize_message(str(exc))
+            ) from exc
 
     async def _handle_post_message_tool(
         self,

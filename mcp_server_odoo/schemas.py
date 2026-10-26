@@ -236,3 +236,15 @@ class ServerInfoResult(BaseModel):
         default_factory=list,
         description="Available companies in the Odoo instance (id and name). Use company_id in search domains to filter by company.",
     )
+
+
+class CompleteActivityResult(BaseModel):
+    """Native activity completion with independently verified history."""
+
+    success: bool
+    preview: bool
+    completed: bool
+    activity: Dict[str, Any]
+    message_id: Optional[int] = None
+    url: str
+    message: str
