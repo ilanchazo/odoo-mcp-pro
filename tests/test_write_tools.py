@@ -291,6 +291,14 @@ class TestWriteTools:
                 "crm.lead", 1, "<p>x</p>", True, [800], None, None, None, False
             )
 
+    @pytest.mark.asyncio
+    async def test_email_without_partners_rejected(self, tool_handler, chatter_connection):
+        """An email with no chosen recipient would still reach every follower."""
+        with pytest.raises(ValidationError, match="partner_ids"):
+            await tool_handler._handle_post_message_tool(
+                "crm.lead", 1, "<p>x</p>", False, None, None, None, None, False
+            )
+
 
 class TestWriteToolsIntegration:
     """Integration tests for write tools with real connection."""

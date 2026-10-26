@@ -853,7 +853,7 @@ class OdooToolHandler:
             model: str,
             record_id: int,
             body: str,
-            internal_note: bool = False,
+            internal_note: bool,
             partner_ids: Optional[List[int]] = None,
             subject: Optional[str] = None,
             attachment_ids: Optional[List[int]] = None,
@@ -875,7 +875,8 @@ class OdooToolHandler:
                 model: Model with chatter (e.g., 'crm.lead', 'sale.order', 'res.partner')
                 record_id: ID of the record
                 body: Message body in HTML (e.g., '<p>Hola Ana,</p><p>...</p>')
-                internal_note: True for an internal note, False to send an email
+                internal_note: REQUIRED. True for an internal note, False to send
+                    an email (then partner_ids is required too)
                 partner_ids: res.partner IDs to email, as many as needed (besides followers)
                 subject: Email subject (defaults to the record name)
                 attachment_ids: ir.attachment IDs to attach (create them first
@@ -1712,6 +1713,13 @@ class OdooToolHandler:
                     raise ValidationError(
                         "An internal note emails no one: drop partner_ids or "
                         "set internal_note=False"
+                    )
+                # An email nobody was chosen for still reaches every follower,
+                # clients included (SANYCCES and SACMI, 26/10/2026).
+                if not internal_note and not partner_ids:
+                    raise ValidationError(
+                        "Sending an email needs explicit partner_ids. For a "
+                        "log note pass internal_note=True"
                     )
                 if not connection.read(model, [record_id], ["id"]):
                     raise NotFoundError(f"Record not found: {model} with ID {record_id}")
