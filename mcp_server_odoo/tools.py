@@ -902,7 +902,9 @@ class OdooToolHandler:
             internal_note=False is «Send message»: Odoo EMAILS partner_ids AND every
             follower of the record subscribed to Discussions, from the current user;
             replies come back to the same thread. internal_note=True is «Log note»:
-            nothing leaves Odoo. An email cannot be undone.
+            nothing leaves Odoo; with partner_ids it is an @mention that lands in
+            the inbox of those INTERNAL users only (a client there is refused).
+            An email cannot be undone.
 
             preview=True (default) sends NOTHING: it returns who would receive it.
             Show that to the user, and call again with preview=False only after
@@ -914,7 +916,8 @@ class OdooToolHandler:
                 body: Message body in HTML (e.g., '<p>Hola Ana,</p><p>...</p>')
                 internal_note: REQUIRED. True for an internal note, False to send
                     an email (then partner_ids is required too)
-                partner_ids: res.partner IDs to email, as many as needed (besides followers)
+                partner_ids: res.partner IDs to email, as many as needed (besides followers);
+                    with internal_note=True, internal users to alert in their inbox
                 subject: Email subject (defaults to the record name)
                 attachment_ids: ir.attachment IDs to attach (create them first
                     with create_record on 'ir.attachment', base64 in 'datas')
@@ -1846,11 +1849,25 @@ class OdooToolHandler:
                     raise ValidationError("No body provided for the message")
                 if not hasattr(connection, "execute_kw"):
                     raise ValidationError("post_message needs the XML-RPC connection")
+                # A note may name only internal users (an @mention that lands in
+                # their inbox); a client named here would be emailed (31/10/2026).
                 if internal_note and partner_ids:
-                    raise ValidationError(
-                        "An internal note emails no one: drop partner_ids or "
-                        "set internal_note=False"
+                    staff = connection.search_read(
+                        "res.users",
+                        [
+                            ("partner_id", "in", [int(p) for p in partner_ids]),
+                            ("share", "=", False),
+                        ],
+                        ["partner_id"],
                     )
+                    staff_pids = {u["partner_id"][0] for u in staff}
+                    outsiders = [int(p) for p in partner_ids if int(p) not in staff_pids]
+                    if outsiders:
+                        raise ValidationError(
+                            "An internal note can only notify internal users; "
+                            f"not internal: {outsiders}. Use internal_note=False "
+                            "to email them"
+                        )
                 # An email nobody was chosen for still reaches every follower,
                 # clients included (SANYCCES and SACMI, 26/10/2026).
                 if not internal_note and not partner_ids:
@@ -1872,7 +1889,9 @@ class OdooToolHandler:
                         else self._would_email(connection, model, record_id, pids)
                     )
                     if internal_note:
-                        summary = "PREVIEW, nothing posted: internal note, no one is emailed"
+                        summary = "PREVIEW, nothing posted: internal note, no one is emailed" + (
+                            f"; inbox alert to partners {pids}" if pids else ""
+                        )
                     else:
                         summary = "PREVIEW, nothing sent. Would email: " + (
                             self._names(recipients) or "NO ONE"

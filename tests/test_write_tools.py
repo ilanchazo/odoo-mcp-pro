@@ -241,6 +241,8 @@ class TestWriteTools:
                 return [{"partner_id": [500, "Iván"]}, {"partner_id": [900, "Seguidor"]}]
             if model == "mail.notification":
                 return [{"res_partner_id": [800, "Ana"], "notification_status": "ready"}]
+            if model == "res.users":
+                return [{"partner_id": [500, "Iván"]}]
             return []
 
         def read(model, ids, fields=None):
@@ -284,12 +286,23 @@ class TestWriteTools:
         assert result["recipients"][0]["email"] == "p800@x.es"
 
     @pytest.mark.asyncio
-    async def test_internal_note_with_partners_rejected(self, tool_handler, chatter_connection):
-        """An internal note cannot carry recipients: it would look sent and not be."""
-        with pytest.raises(ValidationError, match="internal note"):
+    async def test_internal_note_with_outsider_rejected(self, tool_handler, chatter_connection):
+        """A note may not name a non-internal partner: Odoo would email them."""
+        with pytest.raises(ValidationError, match="internal users"):
             await tool_handler._handle_post_message_tool(
                 "crm.lead", 1, "<p>x</p>", True, [800], None, None, None, False
             )
+
+    @pytest.mark.asyncio
+    async def test_internal_note_notifies_internal_user(self, tool_handler, chatter_connection):
+        """A note naming an internal user posts as a note with that partner."""
+        result = await tool_handler._handle_post_message_tool(
+            "crm.lead", 1, "<p>x</p>", True, [500], None, None, None, False
+        )
+        kwargs = chatter_connection.execute_kw.call_args[0][3]
+        assert kwargs["subtype_xmlid"] == "mail.mt_note"
+        assert kwargs["partner_ids"] == [500]
+        assert result["kind"] == "note"
 
     @pytest.mark.asyncio
     async def test_email_without_partners_rejected(self, tool_handler, chatter_connection):
