@@ -286,6 +286,51 @@ class TestWriteTools:
         assert result["recipients"][0]["email"] == "p800@x.es"
 
     @pytest.mark.asyncio
+    async def test_post_message_marshal_error_after_posting(self, tool_handler, chatter_connection):
+        """Odoo posts and then fails to marshal the reply: report success, not an error.
+
+        Reporting the error made callers resend (lead 2404, 20/11/2026: three emails).
+        """
+        posted = {"done": False}
+        base = chatter_connection.search_read.side_effect
+
+        def search_read(model, domain, fields=None, **kwargs):
+            if model == "mail.message":
+                if ["id", ">", 100] in domain:
+                    return [{"id": 101}] if posted["done"] else []
+                return [{"id": 100}]
+            return base(model, domain, fields, **kwargs)
+
+        def execute_kw(*args):
+            posted["done"] = True
+            raise Exception("TypeError: cannot marshal <class 'odoo.api.mail.message'> objects")
+
+        chatter_connection.search_read.side_effect = search_read
+        chatter_connection.execute_kw.side_effect = execute_kw
+        result = await tool_handler._handle_post_message_tool(
+            "crm.lead", 1, "<p>Hola</p>", False, [800], None, None, None, False
+        )
+        assert result["success"] is True
+        assert result["message_id"] == 101
+
+    @pytest.mark.asyncio
+    async def test_post_message_real_failure_still_raises(self, tool_handler, chatter_connection):
+        """If nothing was posted, the error still surfaces."""
+        base = chatter_connection.search_read.side_effect
+
+        def search_read(model, domain, fields=None, **kwargs):
+            if model == "mail.message":
+                return [] if ["id", ">", 100] in domain else [{"id": 100}]
+            return base(model, domain, fields, **kwargs)
+
+        chatter_connection.search_read.side_effect = search_read
+        chatter_connection.execute_kw.side_effect = Exception("Access denied")
+        with pytest.raises(ValidationError, match="Failed to post message"):
+            await tool_handler._handle_post_message_tool(
+                "crm.lead", 1, "<p>Hola</p>", False, [800], None, None, None, False
+            )
+
+    @pytest.mark.asyncio
     async def test_internal_note_with_outsider_rejected(self, tool_handler, chatter_connection):
         """A note may not name a non-internal partner: Odoo would email them."""
         with pytest.raises(ValidationError, match="internal users"):

@@ -1921,8 +1921,42 @@ class OdooToolHandler:
                 if reply_to_message_id:
                     kwargs["parent_id"] = int(reply_to_message_id)
 
-                result = connection.execute_kw(model, "message_post", [[record_id]], kwargs)
-                message_id = result[0] if isinstance(result, list) else int(result)
+                # Odoo creates the message and then fails to marshal the
+                # recordset it returns («cannot marshal objects»). Treating that
+                # as a failure made callers retry and email the client twice or
+                # three times (lead 2404, 20/11/2026). So the outcome is read
+                # back from mail.message, never inferred from the RPC reply.
+                before = connection.search_read(
+                    "mail.message",
+                    [["model", "=", model], ["res_id", "=", record_id]],
+                    ["id"],
+                    limit=1,
+                    order="id desc",
+                )
+                last_id = before[0]["id"] if before else 0
+                try:
+                    result = connection.execute_kw(model, "message_post", [[record_id]], kwargs)
+                    message_id = result[0] if isinstance(result, list) else int(result)
+                except Exception as post_error:
+                    created = connection.search_read(
+                        "mail.message",
+                        [
+                            ["model", "=", model],
+                            ["res_id", "=", record_id],
+                            ["id", ">", last_id],
+                            ["message_type", "=", "comment"],
+                        ],
+                        ["id"],
+                        limit=1,
+                        order="id desc",
+                    )
+                    if not created:
+                        raise post_error
+                    message_id = created[0]["id"]
+                    logger.warning(
+                        f"message_post on {model} {record_id} raised after posting "
+                        f"message {message_id}: {post_error}"
+                    )
 
                 emailed = [] if internal_note else self._emailed(connection, message_id)
                 if internal_note:
