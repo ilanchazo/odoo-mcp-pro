@@ -233,8 +233,17 @@ class TestWriteTools:
     def chatter_connection(self, mock_connection):
         """Connection answering the reads post_message makes."""
         mock_connection.uid = 7
+        posted = {}
+
+        def execute_kw(model, method, args, kwargs):
+            posted["message_id"] = kwargs["message_id"]
+            return 4242
 
         def search_read(model, domain, fields=None, **kwargs):
+            if model == "mail.message":
+                if ["message_id", "=", posted.get("message_id")] in domain:
+                    return [{"id": 4242}]
+                return []
             if model == "ir.model.data":
                 return [{"res_id": 1}]
             if model == "mail.followers":
@@ -254,7 +263,7 @@ class TestWriteTools:
 
         mock_connection.search_read.side_effect = search_read
         mock_connection.read.side_effect = read
-        mock_connection.execute_kw.return_value = 4242
+        mock_connection.execute_kw.side_effect = execute_kw
         return mock_connection
 
     @pytest.mark.asyncio
@@ -286,49 +295,101 @@ class TestWriteTools:
         assert result["recipients"][0]["email"] == "p800@x.es"
 
     @pytest.mark.asyncio
-    async def test_post_message_marshal_error_after_posting(self, tool_handler, chatter_connection):
-        """Odoo posts and then fails to marshal the reply: report success, not an error.
+    @pytest.mark.parametrize("response", [348198, [348198], "marshal", "timeout"])
+    async def test_invoice_auxiliary_note_does_not_hide_sent_email(
+        self, tool_handler, chatter_connection, response
+    ):
+        """The email is 348197; the invoice then creates auxiliary note 348198."""
+        posted = {}
+        base = chatter_connection.search_read.side_effect
 
-        Reporting the error made callers resend (lead 2404, 20/11/2026: three emails).
-        """
-        posted = {"done": False}
+        def execute_kw(model, method, args, kwargs):
+            posted["message_id"] = kwargs["message_id"]
+            if response == "marshal":
+                raise Exception("cannot marshal mail.message objects")
+            if response == "timeout":
+                raise OdooConnectionError("Operation timeout")
+            return response
+
+        def search_read(model, domain, fields=None, **kwargs):
+            if model == "mail.message":
+                assert ["message_id", "=", posted["message_id"]] in domain
+                assert ["model", "=", "account.move"] in domain
+                assert ["res_id", "=", 25136] in domain
+                return [{"id": 348197}]
+            if model == "mail.notification":
+                assert ["mail_message_id", "=", 348197] in domain
+            return base(model, domain, fields, **kwargs)
+
+        chatter_connection.execute_kw.side_effect = execute_kw
+        chatter_connection.search_read.side_effect = search_read
+        result = await tool_handler._handle_post_message_tool(
+            "account.move", 25136, "<p>Factura</p>", False, [800], "Factura", [95720], None, False
+        )
+        assert result["success"] is True
+        assert result["message_id"] == 348197
+        assert result["recipients"][0]["status"] == "ready"
+        chatter_connection.execute_kw.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rows", [[], [{"id": 100}, {"id": 101}]])
+    async def test_missing_or_ambiguous_message_is_not_reported_unsent(
+        self, tool_handler, chatter_connection, rows
+    ):
         base = chatter_connection.search_read.side_effect
 
         def search_read(model, domain, fields=None, **kwargs):
             if model == "mail.message":
-                if ["id", ">", 100] in domain:
-                    return [{"id": 101}] if posted["done"] else []
-                return [{"id": 100}]
+                return rows
             return base(model, domain, fields, **kwargs)
 
-        def execute_kw(*args):
-            posted["done"] = True
-            raise Exception("TypeError: cannot marshal <class 'odoo.api.mail.message'> objects")
+        chatter_connection.search_read.side_effect = search_read
+        result = await tool_handler._handle_post_message_tool(
+            "crm.lead", 1, "<p>Hola</p>", False, [800], None, None, None, False
+        )
+        assert result["success"] is False
+        assert result["message_id"] is None
+        assert "Do not resend" in result["message"]
+        assert "NO ONE" not in result["message"]
+        chatter_connection.execute_kw.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failed_model", ["mail.message", "mail.notification"])
+    async def test_verification_failure_is_uncertain_without_retry(
+        self, tool_handler, chatter_connection, failed_model
+    ):
+        base = chatter_connection.search_read.side_effect
+
+        def search_read(model, domain, fields=None, **kwargs):
+            if model == failed_model:
+                raise OdooConnectionError("Read timed out")
+            return base(model, domain, fields, **kwargs)
 
         chatter_connection.search_read.side_effect = search_read
-        chatter_connection.execute_kw.side_effect = execute_kw
+        result = await tool_handler._handle_post_message_tool(
+            "crm.lead", 1, "<p>Hola</p>", False, [800], None, None, None, False
+        )
+        assert result["success"] is False
+        assert "Do not resend" in result["message"]
+        chatter_connection.execute_kw.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_empty_notifications_do_not_instruct_a_resend(self, tool_handler, chatter_connection):
+        base = chatter_connection.search_read.side_effect
+
+        def search_read(model, domain, fields=None, **kwargs):
+            if model == "mail.notification":
+                return []
+            return base(model, domain, fields, **kwargs)
+
+        chatter_connection.search_read.side_effect = search_read
         result = await tool_handler._handle_post_message_tool(
             "crm.lead", 1, "<p>Hola</p>", False, [800], None, None, None, False
         )
         assert result["success"] is True
-        assert result["message_id"] == 101
-
-    @pytest.mark.asyncio
-    async def test_post_message_real_failure_still_raises(self, tool_handler, chatter_connection):
-        """If nothing was posted, the error still surfaces."""
-        base = chatter_connection.search_read.side_effect
-
-        def search_read(model, domain, fields=None, **kwargs):
-            if model == "mail.message":
-                return [] if ["id", ">", 100] in domain else [{"id": 100}]
-            return base(model, domain, fields, **kwargs)
-
-        chatter_connection.search_read.side_effect = search_read
-        chatter_connection.execute_kw.side_effect = Exception("Access denied")
-        with pytest.raises(ValidationError, match="Failed to post message"):
-            await tool_handler._handle_post_message_tool(
-                "crm.lead", 1, "<p>Hola</p>", False, [800], None, None, None, False
-            )
+        assert result["message_id"] == 4242
+        assert "Do not resend" in result["message"]
+        assert "NO ONE" not in result["message"]
 
     @pytest.mark.asyncio
     async def test_internal_note_with_outsider_rejected(self, tool_handler, chatter_connection):

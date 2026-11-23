@@ -11,6 +11,7 @@ import contextvars
 import json
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -904,7 +905,9 @@ class OdooToolHandler:
             replies come back to the same thread. internal_note=True is «Log note»:
             nothing leaves Odoo; with partner_ids it is an @mention that lands in
             the inbox of those INTERNAL users only (a client there is refused).
-            An email cannot be undone.
+            An email cannot be undone. If verification is uncertain, inspect the
+            chatter and mail.notification before any retry or change of channel.
+            Empty recipients do not establish that no email was sent.
 
             preview=True (default) sends NOTHING: it returns who would receive it.
             Show that to the user, and call again with preview=False only after
@@ -1838,6 +1841,8 @@ class OdooToolHandler:
         preview: bool,
     ) -> Dict[str, Any]:
         """Handle post message tool request (mail.thread.message_post)."""
+        mutation_started = False
+        message_id = None
         try:
             connection, access_controller, sub = await self._get_user_context()
             with perf_logger.track_operation("tool_post_message", model=model):
@@ -1921,42 +1926,48 @@ class OdooToolHandler:
                 if reply_to_message_id:
                     kwargs["parent_id"] = int(reply_to_message_id)
 
-                # Odoo creates the message and then fails to marshal the
-                # recordset it returns («cannot marshal objects»). Treating that
-                # as a failure made callers retry and email the client twice or
-                # three times (lead 2404, 20/11/2026). So the outcome is read
-                # back from mail.message, never inferred from the RPC reply.
-                before = connection.search_read(
-                    "mail.message",
-                    [["model", "=", model], ["res_id", "=", record_id]],
-                    ["id"],
-                    limit=1,
-                    order="id desc",
-                )
-                last_id = before[0]["id"] if before else 0
+                # Invoice attachment processing may post another message in the same
+                # transaction. The return value and latest chatter ID can identify
+                # that auxiliary note instead of the email (DisfrutaBox, 23/11/2026).
+                # Correlate by the RFC Message-ID we supply, including after an RPC
+                # timeout/marshalling error. Never repeat the mutation here.
+                correlation_id = f"<{uuid4().hex}@odoo-mcp.local>"
+                kwargs["message_id"] = correlation_id
+                mutation_started = True
                 try:
-                    result = connection.execute_kw(model, "message_post", [[record_id]], kwargs)
-                    message_id = result[0] if isinstance(result, list) else int(result)
+                    connection.execute_kw(model, "message_post", [[record_id]], kwargs)
                 except Exception as post_error:
-                    created = connection.search_read(
-                        "mail.message",
-                        [
-                            ["model", "=", model],
-                            ["res_id", "=", record_id],
-                            ["id", ">", last_id],
-                            ["message_type", "=", "comment"],
-                        ],
-                        ["id"],
-                        limit=1,
-                        order="id desc",
-                    )
-                    if not created:
-                        raise post_error
-                    message_id = created[0]["id"]
                     logger.warning(
-                        f"message_post on {model} {record_id} raised after posting "
-                        f"message {message_id}: {post_error}"
+                        "message_post response uncertain on %s %s; reconciling %s: %s",
+                        model, record_id, correlation_id, post_error,
                     )
+                created = connection.search_read(
+                    "mail.message",
+                    [
+                        ["model", "=", model],
+                        ["res_id", "=", record_id],
+                        ["message_id", "=", correlation_id],
+                        ["message_type", "=", "comment"],
+                    ],
+                    ["id"],
+                    limit=2,
+                )
+                if len(created) != 1:
+                    return {
+                        "success": False,
+                        "preview": False,
+                        "message_id": None,
+                        "kind": kind,
+                        "recipients": [],
+                        "subject": subject or "",
+                        "url": url,
+                        "message": (
+                            "Posting outcome uncertain. Do not resend or switch channels; "
+                            "inspect chatter and mail.notification before any retry. "
+                            f"Correlation Message-ID: {correlation_id}"
+                        ),
+                    }
+                message_id = created[0]["id"]
 
                 emailed = [] if internal_note else self._emailed(connection, message_id)
                 if internal_note:
@@ -1965,7 +1976,9 @@ class OdooToolHandler:
                     summary = f"Message {message_id} emailed to: {self._names(emailed)}"
                 else:
                     summary = (
-                        f"Message {message_id} posted on {model} {record_id}; NO ONE was emailed"
+                        f"Message {message_id} posted on {model} {record_id}; "
+                        "no email notifications found yet. Do not resend; inspect "
+                        "mail.notification and mail.mail before any retry"
                     )
                 return {
                     "success": True,
@@ -1978,16 +1991,29 @@ class OdooToolHandler:
                     "message": summary,
                 }
 
-        except (ValidationError, NotFoundError):
-            raise
-        except AccessControlError as e:
-            raise ValidationError(f"Access denied: {e}") from e
-        except OdooConnectionError as e:
-            raise ValidationError(f"Connection error: {e}") from e
-        except Exception as e:
-            logger.error(f"Error in post_message tool: {e}")
-            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
-            raise ValidationError(f"Failed to post message: {sanitized_msg}") from e
+        except Exception as exc:
+            if mutation_started:
+                logger.warning("post_message verification incomplete: %s", exc)
+                return {
+                    "success": False,
+                    "preview": False,
+                    "message_id": message_id,
+                    "kind": kind,
+                    "recipients": [],
+                    "subject": subject or "",
+                    "url": url,
+                    "message": (
+                        "Posting outcome uncertain. Do not resend or switch channels; "
+                        "inspect chatter and mail.notification before any retry. "
+                        f"Correlation Message-ID: {correlation_id}"
+                    ),
+                }
+            if isinstance(exc, (ValidationError, NotFoundError)):
+                raise
+            if isinstance(exc, AccessControlError):
+                raise ValidationError(f"Access denied: {exc}") from exc
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(exc))
+            raise ValidationError(f"Failed to post message: {sanitized_msg}") from exc
 
     async def _handle_send_quotation_tool(
         self,
